@@ -15,6 +15,8 @@
 package s3api
 
 import (
+	"bufio"
+	"encoding/xml"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -283,6 +285,94 @@ func TestCustomMountValidation(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("New() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRequestHostHeader sends raw requests to a running server, since Go
+// HTTP clients always set a Host header, and checks that an HTTP/1.1
+// request without one is rejected with 400 Bad Request, as S3 does.
+func TestRequestHostHeader(t *testing.T) {
+	got := make(chan []net.Addr, 1)
+	sa, err := newTestS3ApiServer(WithOnListenAddrs(func(addrs []net.Addr) { got <- addrs }))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- sa.ServeMultiPort([]string{"127.0.0.1:0"}) }()
+
+	var addr string
+	select {
+	case addrs := <-got:
+		addr = addrs[0].String()
+	case err := <-served:
+		t.Fatalf("ServeMultiPort() returned before the listen hook fired: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("listen hook did not fire")
+	}
+	t.Cleanup(func() {
+		if err := sa.ShutDown(); err != nil {
+			t.Errorf("ShutDown() error = %v", err)
+		}
+		<-served
+	})
+
+	tests := []struct {
+		name       string
+		request    string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "missing host",
+			request:    "GET / HTTP/1.1\r\n\r\n",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "BadRequest",
+		},
+		{
+			name:       "empty host",
+			request:    "GET / HTTP/1.1\r\nHost:\r\n\r\n",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "BadRequest",
+		},
+		{
+			name:       "host present",
+			request:    "GET / HTTP/1.1\r\nHost: " + addr + "\r\n\r\n",
+			wantStatus: http.StatusForbidden,
+			wantCode:   "AccessDenied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatalf("set deadline: %v", err)
+			}
+			if _, err := conn.Write([]byte(tt.request)); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			var apiErr struct{ Code string }
+			if err := xml.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Fatalf("error code = %q, want %q", apiErr.Code, tt.wantCode)
 			}
 		})
 	}
